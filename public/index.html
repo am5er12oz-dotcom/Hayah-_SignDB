@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>am</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root{--deep:#0B4F8A;--mid:#2F80C9;--soft:#DCEBFA;--pale:#F2F8FE;--ink:#0A2540;--err:#C0392B;--ok:#1E8449}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;font-family:'Cairo',Tahoma,sans-serif;background:var(--pale);color:var(--ink)}
+  header{background:linear-gradient(160deg,var(--deep),var(--mid));color:#fff;text-align:center;padding:calc(28px + env(safe-area-inset-top,0px)) 20px 56px;border-radius:0 0 40px 40px}
+  header h1{margin:0;font-size:40px;font-weight:800}
+  header p{margin:4px 0 0;opacity:.85}
+  main{max-width:520px;margin:-32px auto 0;padding:0 16px calc(32px + env(safe-area-inset-bottom,0px))}
+  .card{background:#fff;border-radius:24px;padding:18px;box-shadow:0 10px 30px rgba(11,79,138,.15)}
+  .status{padding:10px 12px;border-radius:12px;background:var(--soft);font-weight:600;margin-bottom:12px;font-size:15px}
+  .status.err{background:#FBE3E0;color:var(--err)}
+  .status.ok{background:#DDF3E4;color:var(--ok)}
+  .status.rec{background:#FBE3E0;color:var(--err);font-size:18px}
+  .status.wait{background:#FFF4D6;color:#8A6100;font-size:18px}
+  .cam{position:relative;width:100%;aspect-ratio:4/3;background:#0A2540;border-radius:16px;overflow:hidden}
+  .cam video,.cam canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1);object-fit:cover}
+  pre{direction:ltr;text-align:left;background:var(--pale);border-radius:12px;padding:10px;font-size:12px;margin:12px 0;white-space:pre-wrap;min-height:64px}
+  label{display:block;font-weight:600;margin:10px 0 6px;color:var(--deep)}
+  input{width:100%;padding:14px;font:inherit;font-size:16px;min-height:50px;border:2px solid var(--soft);border-radius:14px;background:var(--pale);color:var(--ink)}
+  input:focus{outline:none;border-color:var(--mid);background:#fff}
+  #info{margin:12px 0 0;font-weight:600;color:var(--deep)}
+  button{width:100%;margin-top:12px;min-height:52px;padding:14px;font:inherit;font-weight:800;font-size:17px;color:#fff;background:var(--deep);border:0;border-radius:14px;cursor:pointer}
+  button.secondary{background:#fff;color:var(--deep);border:2px solid var(--deep)}
+  button:disabled{opacity:.5}
+  #msg{min-height:22px;margin-top:10px;text-align:center;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>حياة</h1>
+  <p>تسجيل إحداثيات الإشارات</p>
+</header>
+<main>
+  <div class="card">
+    <div id="status" class="status">جاري تحميل MediaPipe (محتاج إنترنت)...</div>
+    <div class="cam">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <label for="meaning">معنى الإشارة</label>
+    <input id="meaning" type="text" placeholder="مثال: مرحبا">
+
+    <div id="info">إشارة جديدة — عدد التسجيلات: 0</div>
+    <button id="send" disabled>تسجيل الإشارة 🎬</button>
+    <button id="undo" class="secondary">تراجع (احذف آخر تسجيل)</button>
+    <button id="next" class="secondary">إشارة جديدة (الخانة اللي بعدها)</button>
+    <div id="msg"></div>
+  </div>
+</main>
+
+<script type="module">
+import { HandLandmarker, PoseLandmarker, FaceLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const GAP_MS = 66;        // لقطة كل 66 ملي ثانية تقريباً (15 لقطة في الثانية)
+const END_GAP_MS = 1200;  // لو الإيدين اختفوا ثانية ونص يبقى خلصتي
+const MAX_MS = 12000;     // أقصى مدة للتسجيل 12 ثانية
+const COUNTDOWN = 3;
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const drawing = new DrawingUtils(ctx);
+const statusEl = document.getElementById("status");
+const meaningEl = document.getElementById("meaning");
+const infoEl = document.getElementById("info");
+const sendBtn = document.getElementById("send");
+const nextBtn = document.getElementById("next");
+const undoBtn = document.getElementById("undo");
+const msgEl = document.getElementById("msg");
+
+// نقاط الوجه اللي بنسجّلها: الشفايف والحواجب والعينين
+let FACE_IDX = [1, 33, 133, 263, 362, 61, 291, 13, 14, 70, 105, 300, 334];
+try {
+  const set = new Set();
+  const groups = [
+    FaceLandmarker.FACE_LANDMARKS_LIPS,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW,
+    FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
+    FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
+  ];
+  for (const g of groups) {
+    for (const c of g) { set.add(c.start); set.add(c.end); }
+  }
+  if (set.size > 20) { FACE_IDX = Array.from(set).sort((a, b) => a - b); }
+} catch (e) {}
+
+let handModel = null;
+let poseModel = null;
+let faceModel = null;
+let lastResult = null;
+let lastPose = null;
+let lastFace = null;
+let lastTime = -1;
+let faceKeep = null; // آخر وجه اتشاف (لو الإيد غطّته)
+let contacts = [];
+let currentId = null;
+let currentCount = 0;
+const KEEP = [0, 11, 12, 13, 14, 15, 16]; // الأنف، الكتفين، الكوعين، الرسغين
+
+let mode = "idle"; // idle, countdown, waiting, recording, saving
+let frames = [];
+let recStart = 0;
+let lastSaved = 0;
+let lastSeen = 0;
+let waitStart = 0;
+let audioCtx = null;
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = "status" + (cls ? " " + cls : "");
+}
+function showMsg(text, isErr) {
+  msgEl.textContent = text;
+  msgEl.style.color = isErr ? "#C0392B" : "#1E8449";
+}
+function showInfo(no, count) {
+  currentCount = count;
+  infoEl.textContent = "إشارة " + (no ? "رقم " + no : "جديدة") + " — عدد التسجيلات: " + count;
+}
+function beep(freq, ms) {
+  try {
+    if (!audioCtx) { audioCtx = new AudioContext(); }
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.frequency.value = freq;
+    g.gain.value = 0.1;
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + ms / 1000);
+  } catch (e) {}
+}
+function r4(v) { return Math.round(v * 10000) / 10000; }
+function r3(v) { return Math.round(v * 1000) / 1000; }
+
+// توحيد الإحداثيات: بنشيل تأثير مكان الجسم وبعده عن الكاميرا
+// الإيد: بالنسبة للرسغ ومقاسة بحجم الكف
+function normHand(h) {
+  const ar = canvas.width / canvas.height;
+  const o = h[0];
+  const m = h[9];
+  let s = Math.hypot((m.x - o.x) * ar, m.y - o.y);
+  if (s < 0.0001) { s = 1; }
+  return h.map((q) => [r4(((q.x - o.x) * ar) / s), r4((q.y - o.y) / s), r4((q.z - o.z) / s)]);
+}
+
+async function init() {
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    const base = "https://storage.googleapis.com/mediapipe-models/";
+    handModel = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: base + "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+    poseModel = await PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: base + "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task" },
+      runningMode: "VIDEO",
+      numPoses: 1,
+    });
+    faceModel = await FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: base + "face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+      runningMode: "VIDEO",
+      numFaces: 1,
+    });
+    setStatus("جاري فتح الكاميرا... اسمحي للمتصفح بالوصول لها");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: 640, height: 480 },
+    });
+    video.srcObject = stream;
+    video.addEventListener("loadeddata", () => {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      sendBtn.disabled = false;
+      setStatus("جاهز ✅ وقفي بعيد شوية، واكتبي المعنى واضغطي تسجيل الإشارة", "ok");
+      loop();
+    });
+  } catch (e) {
+    setStatus("مشكلة: " + e.message + " (اتأكدي من الإنترنت ومن السماح للكاميرا، ومن إن الرابط localhost:3001)", "err");
+  }
+}
+
+// MediaPipe بيشتغل بس لما تدوسي تسجيل الإشارة
+function loop() {
+  if (video.currentTime !== lastTime) {
+    lastTime = video.currentTime;
+    if (mode === "idle") {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    } else if (mode !== "saving") {
+      const now = performance.now();
+      lastResult = handModel.detectForVideo(video, now);
+      handleFrame(now);
+      draw();
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawArms();
+  drawFace();
+  drawContacts();
+  for (const h of lastResult.landmarks) {
+    drawing.drawConnectors(h, HandLandmarker.HAND_CONNECTIONS, { color: "#2F80C9", lineWidth: 4 });
+    drawing.drawLandmarks(h, { color: "#0B4F8A", fillColor: "#ffffff", radius: 3 });
+  }
+}
+
+function drawArms() {
+  if (!lastPose) { return; }
+  if (lastPose.landmarks.length === 0) { return; }
+  const L = lastPose.landmarks[0];
+  const W = canvas.width;
+  const H = canvas.height;
+  const links = [[11, 13], [13, 15], [12, 14], [14, 16], [11, 12]];
+  ctx.strokeStyle = "#F5A623";
+  ctx.lineWidth = 6;
+  ctx.lineCap = "round";
+  for (const k of links) {
+    ctx.beginPath();
+    ctx.moveTo(L[k[0]].x * W, L[k[0]].y * H);
+    ctx.lineTo(L[k[1]].x * W, L[k[1]].y * H);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#F5A623";
+  for (const i of [11, 12, 13, 14]) {
+    ctx.beginPath();
+    ctx.arc(L[i].x * W, L[i].y * H, 8, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawContacts() {
+  ctx.strokeStyle = "#2ECC71";
+  ctx.lineWidth = 3;
+  for (const c of contacts) {
+    if (c[4] < 1.0) {
+      ctx.beginPath();
+      ctx.moveTo(c[0] * canvas.width, c[1] * canvas.height);
+      ctx.lineTo(c[2] * canvas.width, c[3] * canvas.height);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawFace() {
+  if (!lastFace) { return; }
+  if (lastFace.faceLandmarks.length === 0) { return; }
+  const L = lastFace.faceLandmarks[0];
+  ctx.fillStyle = "#7FE0C0";
+  for (const i of FACE_IDX) {
+    ctx.beginPath();
+    ctx.arc(L[i].x * canvas.width, L[i].y * canvas.height, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function frameOf(L) {
+  const ar = canvas.width / canvas.height;
+  const a = L[33];
+  const b = L[263];
+  const s = Math.hypot((a.x - b.x) * ar, a.y - b.y);
+  if (s < 0.01) { return null; }
+  return { L: L, ar: ar, s: s, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
+}
+
+// لو الوجه ما اتشافش (الإيد غطّته) بنستخدم آخر وجه اتشاف لحد 0.7 ثانية
+function currentFaceFrame(now) {
+  if (lastFace) {
+    if (lastFace.faceLandmarks.length > 0) { faceKeep = { L: lastFace.faceLandmarks[0], time: now }; }
+  }
+  if (!faceKeep) { return null; }
+  if (now - faceKeep.time > 700) { return null; }
+  return frameOf(faceKeep.L);
+}
+
+// أقرب نقطة في الإيد لأقرب نقطة في الوجه (بوحدة المسافة بين العينين)
+function nearestFace(h, F) {
+  let best = 1e9;
+  let bf = -1;
+  let bh = -1;
+  for (let hi = 0; hi < h.length; hi++) {
+    const hx = h[hi].x * F.ar;
+    const hy = h[hi].y;
+    for (let fi = 0; fi < F.L.length; fi++) {
+      const dx = hx - F.L[fi].x * F.ar;
+      const dy = hy - F.L[fi].y;
+      const d = dx * dx + dy * dy;
+      if (d < best) { best = d; bf = fi; bh = hi; }
+    }
+  }
+  return [r3(Math.sqrt(best) / F.s), bf, bh];
+}
+
+function snapshot(F) {
+  const hd = lastResult.handedness ? lastResult.handedness : lastResult.handednesses;
+  return lastResult.landmarks.map((h, i) => {
+    const o = {
+      label: hd && hd[i] && hd[i][0] ? hd[i][0].categoryName : "",
+      p: normHand(h),
+    };
+    if (F) {
+      // مكان الرسغ وأطراف الصوابع بالنسبة للوجه (x وy بس)
+      o.rel = [0, 4, 8, 12, 16, 20].map((k) => [
+        r3(((h[k].x - F.cx) * F.ar) / F.s),
+        r3((h[k].y - F.cy) / F.s),
+      ]);
+      o.near = nearestFace(h, F);
+      contacts.push([h[o.near[2]].x, h[o.near[2]].y, F.L[o.near[1]].x, F.L[o.near[1]].y, o.near[0]]);
+    }
+    return o;
+  });
+}
+
+function poseSnapshot() {
+  if (!lastPose) { return []; }
+  if (lastPose.landmarks.length === 0) { return []; }
+  const L = lastPose.landmarks[0];
+  const ar = canvas.width / canvas.height;
+  const a = L[11];
+  const b = L[12];
+  const cx = (a.x + b.x) / 2;
+  const cy = (a.y + b.y) / 2;
+  const cz = (a.z + b.z) / 2;
+  const s = Math.hypot((a.x - b.x) * ar, a.y - b.y);
+  if (s < 0.02) { return []; }
+  return KEEP.map((i) => {
+    const q = L[i];
+    return [
+      r4(((q.x - cx) * ar) / s),
+      r4((q.y - cy) / s),
+      r4((q.z - cz) / s),
+      r4(q.visibility ? q.visibility : 0),
+    ];
+  });
+}
+
+// الوجه: بالنسبة لنص المسافة بين العينين ومقاس بعرضها
+function faceSnapshot() {
+  if (!lastFace) { return []; }
+  if (lastFace.faceLandmarks.length === 0) { return []; }
+  const L = lastFace.faceLandmarks[0];
+  const ar = canvas.width / canvas.height;
+  const a = L[33];
+  const b = L[263];
+  const cx = (a.x + b.x) / 2;
+  const cy = (a.y + b.y) / 2;
+  const cz = (a.z + b.z) / 2;
+  const s = Math.hypot((a.x - b.x) * ar, a.y - b.y);
+  if (s < 0.01) { return []; }
+  return FACE_IDX.map((i) => {
+    const q = L[i];
+    return [r3(((q.x - cx) * ar) / s), r3((q.y - cy) / s), r3((q.z - cz) / s)];
+  });
+}
+
+function handleFrame(now) {
+  const hasHands = lastResult.landmarks.length > 0;
+
+  if (mode === "waiting") {
+    if (hasHands) {
+      mode = "recording";
+      frames = [];
+      recStart = now;
+      lastSaved = -1000;
+      lastSeen = now;
+      beep(880, 200);
+      setStatus("🔴 بيسجّل... اعملي الإشارة، ولما تخلصي نزّلي إيديكي", "rec");
+    } else if (now - waitStart > 20000) {
+      mode = "idle";
+      sendBtn.disabled = false;
+      setStatus("ماظهرتش إيد، اتلغى. جرّبي تاني", "err");
+    }
+  }
+
+  if (mode === "recording") {
+    if (hasHands) { lastSeen = now; }
+    if (now - lastSaved >= GAP_MS) {
+      // الجسم والوجه بنحسبهم وقت حفظ اللقطة بس، عشان الجهاز ما يتقلش
+      contacts = [];
+      lastPose = poseModel.detectForVideo(video, now);
+      lastFace = faceModel.detectForVideo(video, now);
+      frames.push({
+        t: Math.round(now - recStart),
+        hands: hasHands ? snapshot(currentFaceFrame(now)) : [],
+        pose: poseSnapshot(),
+        face: faceSnapshot(),
+      });
+      lastSaved = now;
+    }
+    const elapsed = now - recStart;
+    setStatus("🔴 بيسجّل... " + (elapsed / 1000).toFixed(1) + " ث (نزّلي إيديكي لما تخلصي)", "rec");
+    if (now - lastSeen > END_GAP_MS) { finishRecording(); }
+    else if (elapsed > MAX_MS) { finishRecording(); }
+  }
+}
+
+async function finishRecording() {
+  mode = "saving";
+  beep(440, 350);
+  while (frames.length > 0 && frames[frames.length - 1].hands.length === 0) {
+    frames.pop();
+  }
+  if (frames.length < 5) {
+    mode = "idle";
+    sendBtn.disabled = false;
+    setStatus("التسجيل كان قصير جداً، اتلغى. جرّبي تاني", "err");
+    return;
+  }
+  const duration = frames[frames.length - 1].t;
+  setStatus("بيحفظ التسجيل...");
+  try {
+    const r = await fetch("/api/signs/sample", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: currentId,
+        meaning: meaningEl.value.trim(),
+        duration: duration,
+        norm: "hand=wrist+handsize, pose=shoulders+shoulderwidth, face=eyes-center+eye-distance, rel=wrist+fingertips in face frame xy, near=[dist,faceIdx,handIdx]",
+        faceIdx: FACE_IDX,
+        frames: frames,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) { throw new Error(d.error); }
+    currentId = d.id;
+    showInfo(d.no, d.count);
+    setStatus("اتسجّل ✅ (" + (duration / 1000).toFixed(1) + " ث، " + frames.length + " لقطة)", "ok");
+    showMsg("تسجيل رقم " + d.count + " اتحفظ. دوسي تسجيل الإشارة لتسجيل جديد", false);
+  } catch (e) {
+    setStatus("ماتحفظش: " + (e.message ? e.message : "حصل خطأ"), "err");
+  }
+  mode = "idle";
+  sendBtn.disabled = false;
+}
+
+sendBtn.onclick = () => {
+  if (meaningEl.value.trim() === "") { showMsg("اكتبي معنى الإشارة الأول", true); return; }
+  if (mode !== "idle") { return; }
+  beep(600, 100);
+  lastPose = null;
+  lastFace = null;
+  faceKeep = null;
+  contacts = [];
+  mode = "countdown";
+  sendBtn.disabled = true;
+  showMsg("", false);
+  let n = COUNTDOWN;
+  setStatus("استعدي... " + n, "wait");
+  const timer = setInterval(() => {
+    n = n - 1;
+    if (n > 0) {
+      beep(600, 100);
+      setStatus("استعدي... " + n, "wait");
+    } else {
+      clearInterval(timer);
+      mode = "waiting";
+      waitStart = performance.now();
+      setStatus("ارفعي إيديكي وابدئي الإشارة ✋", "wait");
+    }
+  }, 1000);
+};
+
+undoBtn.onclick = async () => {
+  if (!currentId) { showMsg("مفيش تسجيل تحذفيه", true); return; }
+  if (currentCount === 0) { showMsg("مفيش تسجيل تحذفيه", true); return; }
+  try {
+    const r = await fetch("/api/signs/" + currentId + "/last", { method: "DELETE" });
+    const d = await r.json();
+    if (!r.ok) { throw new Error(d.error); }
+    infoEl.textContent = "عدد التسجيلات: " + d.count;
+    currentCount = d.count;
+    showMsg("اتحذف آخر تسجيل", false);
+  } catch (e) {
+    showMsg(e.message ? e.message : "حصل خطأ", true);
+  }
+};
+
+nextBtn.onclick = () => {
+  if (mode !== "idle") { return; }
+  currentId = null;
+  meaningEl.value = "";
+  showInfo(null, 0);
+  showMsg("جاهزة لإشارة جديدة", false);
+};
+
+init();
+</script>
+</body>
+</html>

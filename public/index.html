@@ -48,6 +48,9 @@
     <label for="meaning">معنى الإشارة</label>
     <input id="meaning" type="text" placeholder="مثال: مرحبا">
 
+    <label for="dur">مدة التسجيل بالثواني (اختياري)</label>
+    <input id="dur" type="number" min="1" max="12" step="0.5" inputmode="decimal" placeholder="مثال: 2  (لو فاضية: يخلص لما تنزلي إيديكي)">
+
     <div id="info">إشارة جديدة — عدد التسجيلات: 0</div>
     <button id="send" disabled>تسجيل الإشارة 🎬</button>
     <button id="undo" class="secondary">تراجع (احذف آخر تسجيل)</button>
@@ -70,6 +73,7 @@ const ctx = canvas.getContext("2d");
 const drawing = new DrawingUtils(ctx);
 const statusEl = document.getElementById("status");
 const meaningEl = document.getElementById("meaning");
+const durEl = document.getElementById("dur");
 const infoEl = document.getElementById("info");
 const sendBtn = document.getElementById("send");
 const nextBtn = document.getElementById("next");
@@ -112,6 +116,7 @@ let recStart = 0;
 let lastSaved = 0;
 let lastSeen = 0;
 let waitStart = 0;
+let fixedMs = 0; // مدة التسجيل اللي حددتيها (0 = تلقائي)
 let audioCtx = null;
 
 function setStatus(text, cls) {
@@ -164,11 +169,17 @@ async function init() {
       runningMode: "VIDEO",
       numHands: 2,
     });
-    poseModel = await PoseLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: base + "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task" },
+    // موديل الجسم الكامل أدق من lite في الدراعين. لو ماتحمّلش بنرجع للـ lite
+    const poseOpts = (file) => ({
+      baseOptions: { modelAssetPath: base + "pose_landmarker/" + file + "/float16/1/" + file + ".task" },
       runningMode: "VIDEO",
       numPoses: 1,
     });
+    try {
+      poseModel = await PoseLandmarker.createFromOptions(fileset, poseOpts("pose_landmarker_full"));
+    } catch (e) {
+      poseModel = await PoseLandmarker.createFromOptions(fileset, poseOpts("pose_landmarker_lite"));
+    }
     faceModel = await FaceLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: base + "face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
       runningMode: "VIDEO",
@@ -374,10 +385,12 @@ function handleFrame(now) {
       mode = "recording";
       frames = [];
       recStart = now;
+      const secs = parseFloat(durEl.value);
+      fixedMs = secs > 0 ? Math.min(secs * 1000, MAX_MS) : 0;
       lastSaved = -1000;
       lastSeen = now;
       beep(880, 200);
-      setStatus("🔴 بيسجّل... اعملي الإشارة، ولما تخلصي نزّلي إيديكي", "rec");
+      setStatus(fixedMs > 0 ? "🔴 بيسجّل... اعملي الإشارة" : "🔴 بيسجّل... اعملي الإشارة، ولما تخلصي نزّلي إيديكي", "rec");
     } else if (now - waitStart > 20000) {
       mode = "idle";
       sendBtn.disabled = false;
@@ -401,9 +414,15 @@ function handleFrame(now) {
       lastSaved = now;
     }
     const elapsed = now - recStart;
-    setStatus("🔴 بيسجّل... " + (elapsed / 1000).toFixed(1) + " ث (نزّلي إيديكي لما تخلصي)", "rec");
-    if (now - lastSeen > END_GAP_MS) { finishRecording(); }
-    else if (elapsed > MAX_MS) { finishRecording(); }
+    if (fixedMs > 0) {
+      const left = Math.max(0, (fixedMs - elapsed) / 1000);
+      setStatus("🔴 بيسجّل... فاضل " + left.toFixed(1) + " ث", "rec");
+      if (elapsed >= fixedMs) { finishRecording(); }
+    } else {
+      setStatus("🔴 بيسجّل... " + (elapsed / 1000).toFixed(1) + " ث (نزّلي إيديكي لما تخلصي)", "rec");
+      if (now - lastSeen > END_GAP_MS) { finishRecording(); }
+      else if (elapsed > MAX_MS) { finishRecording(); }
+    }
   }
 }
 
